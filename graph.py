@@ -1,3 +1,36 @@
+import os
+
+import chromadb
+from dotenv import load_dotenv
+from llama_index.core import Settings, StorageContext, VectorStoreIndex
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.llms.google_genai import GoogleGenAI
+
+# 1. Load keys and configure models
+load_dotenv()
+Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
+Settings.llm = GoogleGenAI(model="gemini-3.5-flash-lite")
+
+# 2. Connect to the existing ChromaDB
+print("Connecting to ChromaDB...")
+db = chromadb.PersistentClient(path="./chroma_db")
+chroma_collection = db.get_or_create_collection("student_notes")
+
+# 3. Rebuild the index from the local database
+from llama_index.vector_stores.chroma import ChromaVectorStore
+
+vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+# This loads the index without needing to re-embed the PDF!
+index = VectorStoreIndex.from_vector_store(
+    vector_store, 
+    storage_context=storage_context
+)
+
+# 4. Create a Retriever (fetches text, but doesn't auto-generate answers)
+retriever = index.as_retriever(similarity_top_k=3)
+
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -14,18 +47,36 @@ class GraphState(TypedDict):
 
 def retriever_agent(state: GraphState):
     print("🕵️ RETRIEVER: Fetching context and writing draft...")
+    question = state["question"]
+    feedback = state.get("critic_feedback", "")
     
-    # 1. Use ChromaDB query_engine here to fetch context
-    # context = query_engine.query(state["question"]).source_nodes
+    # 1. Fetch the most relevant chunks from ChromaDB
+    nodes = retriever.retrieve(question)
     
-    # 2. Use Gemini to write a draft answer based on context + feedback
-    # If the critic sent feedback from a previous loop, include it in the prompt!
-    draft = f"Draft answer for: {state['question']}"
+    # Combine the text from the retrieved chunks
+    context = "\n\n".join([node.get_content() for node in nodes])
     
-    # Increment the loop count so we don't get stuck forever
+    # 2. Build the prompt dynamically
+    prompt = (
+        "You are a helpful study assistant. Answer the question using ONLY the provided context.\n\n"
+        f"Question: {question}\n\n"
+        f"Context:\n{context}\n\n"
+    )
+    
+    # 3. If the graph looped back, inject the Critic's instructions!
+    if feedback:
+        print(f"🕵️ RETRIEVER: Adjusting based on feedback: {feedback}")
+        prompt += f"PREVIOUS ATTEMPT FEEDBACK:\nA reviewer found this issue with your last draft: '{feedback}'. Please fix it in this new draft.\n\n"
+        
+    prompt += "Draft Answer:"
+    
+    # 4. Generate the draft using the globally configured Gemini model
+    draft = Settings.llm.complete(prompt).text
+    
+    # Increment the loop count
     current_loops = state.get("loop_count", 0) + 1
     
-    return {"draft_answer": draft, "loop_count": current_loops, "context": "..."}
+    return {"draft_answer": draft, "loop_count": current_loops, "context": context}
 
 def critic_agent(state: GraphState):
     print("🧐 CRITIC: Reviewing the draft against the context...")
