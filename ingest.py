@@ -62,7 +62,8 @@ if result.markdown and result.markdown.pages:
             
     full_text = "\n\n".join(valid_pages)
 if not full_text:
-    raise Exception("Parsing finished, but no valid markdown text was returned.")
+    raise RuntimeError("Parsing finished, but no valid markdown text was returned.")
+
 documents = [Document(text=full_text)]
 print("Successfully extracted into markdown!")
 
