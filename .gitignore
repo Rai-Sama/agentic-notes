@@ -1,0 +1,12 @@
+# Security
+.env
+
+# Database
+chroma_db/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Test Data
+student_notes.pdf
