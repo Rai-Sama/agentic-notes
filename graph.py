@@ -1,5 +1,3 @@
-import os
-
 import chromadb
 from dotenv import load_dotenv
 from llama_index.core import Settings, StorageContext, VectorStoreIndex
@@ -81,11 +79,43 @@ def retriever_agent(state: GraphState):
 def critic_agent(state: GraphState):
     print("🧐 CRITIC: Reviewing the draft against the context...")
     
-    # Use Gemini to compare state["draft_answer"] against state["context"]
-    # Ask Gemini to output either "PASS" or a list of corrections.
-    feedback = "FAILED: Missing details about X" # Or "PASS"
+    question = state["question"]
+    context = state.get("context", "")
+    draft = state.get("draft_answer", "")
     
-    return {"critic_feedback": feedback}
+    # 1. Define strict evaluation rules
+    evaluation_prompt = f"""
+    You are a strict academic reviewer grading an AI assistant's draft answer. 
+    Your job is to ensure the draft accurately answers the user's question using ONLY the provided context.
+    
+    [USER QUESTION]
+    {question}
+    
+    [SOURCE CONTEXT]
+    {context}
+    
+    [DRAFT ANSWER]
+    {draft}
+    
+    [EVALUATION RULES]
+    1. Does the draft answer the question directly?
+    2. Is every claim in the draft supported by the SOURCE CONTEXT? (No outside knowledge allowed).
+    3. Is the draft missing any crucial details from the context that the user asked for?
+    
+    [OUTPUT FORMAT]
+    - If the draft passes all rules, output EXACTLY the word: PASS
+    - If the draft fails, output "FAILED: " followed by a brief, specific instruction on what the Retriever needs to fix.
+    
+    Review:
+    """
+    
+    # 2. Call Gemini to evaluate the draft
+    response = Settings.llm.complete(evaluation_prompt).text.strip()
+    
+    print(f"🧐 CRITIC VERDICT: {response}")
+    
+    # 3. Return the feedback to update the state
+    return {"critic_feedback": response}
 
 def formatter_agent(state: GraphState):
     print("✨ FORMATTER: Structuring final output with flashcards...")
