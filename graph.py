@@ -38,6 +38,7 @@ from typing_extensions import NotRequired
 class GraphState(TypedDict):
     question: str
     loop_count: int
+    chat_history: NotRequired[str]  # Add this!
     context: NotRequired[str]
     draft_answer: NotRequired[str]
     critic_feedback: NotRequired[str]
