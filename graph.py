@@ -1,44 +1,98 @@
+import os
+import time
+from typing import TypedDict
+
 import chromadb
 from dotenv import load_dotenv
+from google.genai.errors import APIError as GoogleAPIError
+from groq import APIError as GroqAPIError
+from langgraph.graph import END, START, StateGraph
 from llama_index.core import Settings, StorageContext, VectorStoreIndex
+from llama_index.core.postprocessor import MetadataReplacementPostProcessor
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.google_genai import GoogleGenAI
+from llama_index.llms.groq import Groq
+from llama_index.vector_stores.chroma import ChromaVectorStore
+from typing_extensions import NotRequired
 
-# 1. Load keys and configure models
 load_dotenv()
-Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
-Settings.llm = GoogleGenAI(model="gemini-3.6-flash")
 
-# 2. Connect to the existing ChromaDB
+# ==========================================
+# 1. FLEET & FALLBACK CONFIGURATION
+# ==========================================
+print("Configuring Fleet...")
+Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
+
+llm_fleet = []
+if os.getenv("GROQ_API_KEY"):
+    llm_fleet.append(Groq(model="llama-3.3-70b-versatile", api_key=os.getenv("GROQ_API_KEY")))
+if os.getenv("GOOGLE_API_KEY_1"):
+    llm_fleet.append(GoogleGenAI(model="models/gemini-3.6-flash", api_key=os.getenv("GOOGLE_API_KEY_1")))
+if os.getenv("GOOGLE_API_KEY_1"):
+    llm_fleet.append(GoogleGenAI(model="models/gemini-3.5-flash-lite", api_key=os.getenv("GOOGLE_API_KEY_1")))
+
+if not llm_fleet:
+    raise ValueError("No API keys found to build the LLM Fleet!")
+
+current_llm_index = 0
+
+def call_llm_with_fallback(prompt: str) -> str:
+    """Helper function to run any prompt through the fault-tolerant fleet."""
+    global current_llm_index
+    page_success = False
+    result_text = ""
+    
+    while current_llm_index < len(llm_fleet) and not page_success:
+        Settings.llm = llm_fleet[current_llm_index]
+        max_retries = 3 # Shorter retries for interactive chat
+        
+        for attempt in range(max_retries):
+            try:
+                result_text = Settings.llm.complete(prompt).text
+                page_success = True
+                break 
+            except (GoogleAPIError, GroqAPIError):
+                wait_time = 5 
+                print(f"\n⚠️ API Error on LLM #{current_llm_index + 1}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+        
+        if not page_success:
+            print(f"\n❌ LLM #{current_llm_index + 1} completely failed. Rotating to next fallback...")
+            current_llm_index += 1
+
+    if not page_success:
+        raise RuntimeError("FATAL: Exhausted all LLM fallbacks during chat.")
+        
+    return result_text
+
+
+# ==========================================
+# 2. DATABASE & RETRIEVER CONFIGURATION
+# ==========================================
 print("Connecting to ChromaDB...")
 db = chromadb.PersistentClient(path="./chroma_db")
 chroma_collection = db.get_or_create_collection("student_notes")
 
-# 3. Rebuild the index from the local database
-from llama_index.vector_stores.chroma import ChromaVectorStore
-
 vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
 storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-# This loads the index without needing to re-embed the PDF!
-index = VectorStoreIndex.from_vector_store(
-    vector_store, 
-    storage_context=storage_context
+index = VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
+
+# BUGFIX: Added the postprocessor to re-expand the sentence windows!
+postprocessor = MetadataReplacementPostProcessor(target_metadata_key="window")
+retriever = index.as_retriever(
+    similarity_top_k=3, 
+    node_postprocessors=[postprocessor]
 )
 
-# 4. Create a Retriever (fetches text, but doesn't auto-generate answers)
-retriever = index.as_retriever(similarity_top_k=10)
 
-from typing import TypedDict
-
-from langgraph.graph import END, START, StateGraph
-from typing_extensions import NotRequired
-
-
+# ==========================================
+# 3. LANGGRAPH STATE & AGENTS
+# ==========================================
 class GraphState(TypedDict):
     question: str
     loop_count: int
-    chat_history: NotRequired[str]  # Add this!
+    chat_history: NotRequired[str]
     context: NotRequired[str]
     draft_answer: NotRequired[str]
     critic_feedback: NotRequired[str]
@@ -46,59 +100,70 @@ class GraphState(TypedDict):
 
 def retriever_agent(state: GraphState):
     print("🕵️ RETRIEVER: Fetching context and writing draft...")
-    
     question = state["question"]
     history = state.get("chat_history", "")
     feedback = state.get("critic_feedback", "")
+    loop_count = state.get("loop_count", 0)
     
-    # 1. Handle Follow-up vs. New Topic
-    search_query = question
-    if history:
-        rewrite_prompt = (
-            "Given the following conversation history, rewrite the user's new question into a standalone search query. "
-            "If it is a completely new topic, just return the original question.\n\n"
-            f"History:\n{history}\n\n"
-            f"New Question: {question}\n\n"
-            "Standalone Query:"
+    if feedback and loop_count > 0:
+        refine_prompt = (
+            f"The previous search for '{question}' failed because: '{feedback}'\n"
+            "Generate a new search query using different keywords from the feedback to find the correct section in the notes.\n"
+            "STRICT RULE: Output ONLY the raw search query string. No conversational filler.\n"
+            "New Search Query:"
         )
-        search_query = Settings.llm.complete(rewrite_prompt).text.strip()
-        print(f"🔄 CONTEXTUALIZED QUERY: {search_query}")
-    
-    # 2. Fetch context using the STANDALONE query
+        search_query = call_llm_with_fallback(refine_prompt).strip()
+        print(f"🔄 CRAG RE-RETRIEVAL QUERY: {search_query}")
+    else:
+        search_query = question
+
     nodes = retriever.retrieve(search_query)
+    sources = list({node.metadata.get("file_name", "student_notes.pdf") for node in nodes})
+    sources_str = ", ".join(sources) if sources else "Uploaded Notes"
+
     context = "\n\n".join([node.get_content() for node in nodes])
     
-    #print(f"Context being passed to gemini: {context}") # FOR DEBUGGING
-    # 2. Build the prompt dynamically
-    # 3. Build the draft prompt
-    prompt = (
-        "You are a helpful study assistant. Answer the question using ONLY the provided context.\n\n"
-        f"Question: {question}\n\n"
-        f"Context:\n{context}\n\n"
-    )
+    # --- TEMPORARY DEBUG PRINT ---
+    print("\n" + "="*50)
+    print("🔍 DEBUG - WHAT CHROMADB RETURNED:")
+    print(context[:800] + "...\n[Context truncated for display]")
+    print("="*50 + "\n")
+    # -----------------------------
+    
+    prompt = f"""
+    You are an academic extractor. Answer the user's question using ONLY the provided context.
+    
+    CRITICAL RULES:
+    1. BLIND OBEDIENCE: If the context says the sky is green, you say the sky is green. Do not use outside knowledge. 
+    2. IGNORE EXAMPLES: If the context contains specific industry case studies (like Skincare or Food Delivery), DO NOT include them in your answer unless the user specifically asked for examples. Extract only the general theory.
+    
+    Question: {question}
+    
+    Context:
+    {context}
+    """
     
     if feedback:
-        prompt += f"PREVIOUS ATTEMPT FEEDBACK:\nFix this issue: '{feedback}'.\n\n"
-        
-    prompt += "Draft Answer:"
+        prompt += f"\nCRITIC FEEDBACK TO ADDRESS: {feedback}\n"
     
-    # 4. Generate the draft
-    draft = Settings.llm.complete(prompt).text
-    current_loops = state.get("loop_count", 0) + 1
+    prompt += "\nDraft Answer:"
+    draft = call_llm_with_fallback(prompt)
     
-    return {"draft_answer": draft, "loop_count": current_loops, "context": context}
+    return {
+        "draft_answer": draft, 
+        "loop_count": loop_count + 1, 
+        "context": context,
+        "sources": sources_str
+    }
 
 def critic_agent(state: GraphState):
-    print("🧐 CRITIC: Reviewing the draft against the context...")
-    
+    print("🧐 CRITIC: Evaluating draft for logical coherence...")
     question = state["question"]
     context = state.get("context", "")
     draft = state.get("draft_answer", "")
     
-    # 1. Define strict evaluation rules
     evaluation_prompt = f"""
-    You are a strict academic reviewer grading an AI assistant's draft answer. 
-    Your job is to ensure the draft accurately answers the user's question using ONLY the provided context.
+    You are an evaluator checking a draft against the SOURCE CONTEXT.
     
     [USER QUESTION]
     {question}
@@ -109,35 +174,49 @@ def critic_agent(state: GraphState):
     [DRAFT ANSWER]
     {draft}
     
-    [EVALUATION RULES]
-    1. Does the draft answer the question directly?
-    2. Is every claim in the draft supported by the SOURCE CONTEXT? (No outside knowledge allowed).
-    3. Is the draft missing any crucial details from the context that the user asked for?
+    [CRITICAL EVALUATION RULES]
+    1. PARAMETRIC BLINDNESS: You MUST NOT judge the draft based on standard economic theory (like "supply and demand"). You must ONLY judge it against the SOURCE CONTEXT. If the context gives a weird, brief, or non-standard definition, and the draft accurately reports it, you MUST PASS IT.
+    2. COHERENCE: Did the draft successfully avoid mixing up specific industry case studies (like skincare) with the general theory?
     
     [OUTPUT FORMAT]
-    - If the draft passes all rules, output EXACTLY the word: PASS
-    - If the draft fails, output "FAILED: " followed by a brief, specific instruction on what the Retriever needs to fix.
+    - If the draft accurately reflects the source context (even if the context is brief), output EXACTLY the word: PASS
+    - If it hallucinated outside knowledge or mixed up case studies, output "FAILED: " followed by a brief instruction.
     
     Review:
     """
     
-    # 2. Call Gemini to evaluate the draft
-    response = Settings.llm.complete(evaluation_prompt).text.strip()
-    
+    response = call_llm_with_fallback(evaluation_prompt).strip()
     print(f"🧐 CRITIC VERDICT: {response}")
-    
-    # 3. Return the feedback to update the state
     return {"critic_feedback": response}
-
-def formatter_agent(state: GraphState):
-    print("✨ FORMATTER: Structuring final output with flashcards...")
-    
-    draft = state.get("draft_answer", "")
+def fallback_agent(state: GraphState):
+    """Triggered when notes fail to provide a complete answer after retries."""
+    print("🤖 FALLBACK: Context in notes was insufficient. Using Frontier Knowledge...")
     question = state["question"]
     
-    # 1. Define the formatting instructions
+    fallback_prompt = (
+        "You are an expert academic tutor. The user asked a question that was not fully covered in their class notes.\n"
+        "Provide a complete, accurate, and highly educational answer using your general knowledge.\n\n"
+        f"Question: {question}\n\nAnswer:"
+    )
+    
+    # Call your highest-reasoning frontier model (Groq / Gemini 3.6 Flash)
+    frontier_answer = call_llm_with_fallback(fallback_prompt)
+    
+    disclaimer = (
+        "\n\n> ⚠️ **Note:** *Your uploaded notes did not contain complete details on this topic. "
+        "This response was generated using general academic knowledge.*"
+    )
+    
+    return {"final_answer": frontier_answer + disclaimer}
+
+def formatter_agent(state: GraphState):
+    print("✨ FORMATTER: Structuring final output with flashcards & citations...")
+    draft = state.get("draft_answer", "")
+    question = state["question"]
+    sources = state.get("sources", "Uploaded Notes")
+    
     formatting_prompt = f"""
-    You are an expert educational designer. Your task is to take a raw, verified academic answer and format it into a highly readable, structured study guide.
+    You are an expert educational designer. Format this raw answer into a structured study guide.
     
     [ORIGINAL QUESTION]
     {question}
@@ -146,71 +225,66 @@ def formatter_agent(state: GraphState):
     {draft}
     
     [INSTRUCTIONS]
-    1. Rewrite the raw answer into a clear, engaging explanation using Markdown formatting. Use headings, bullet points, and bold text for readability.
-    2. STRICT RULE: Do NOT add new factual information. You must only structure the facts provided in the raw answer.
-    3. At the end of your response, add a "## Flashcards" section. Generate 2 to 3 flashcards summarizing the core concepts from the answer. 
+    1. Rewrite into a clean, structured explanation using Markdown headers and bullet points.
+    2. Do NOT add new factual information.
+    3. At the end, add a "## Flashcards" section (2-3 flashcards).
     
-    Format the flashcards exactly like this:
-    **Q:** [Question]
-    **A:** [Answer]
-    ---
-       
     Polished Output:
     """
     
-    # 2. Call Gemini to format the text
-    final = Settings.llm.complete(formatting_prompt).text
+    final = call_llm_with_fallback(formatting_prompt)
     
-    # 3. Update the state with the final string
-    return {"final_answer": final}
+    # Append the source citation at the very bottom
+    final_with_sources = f"{final}\n\n---\n**📚 Sources Referenced:** `{sources}`"
+    return {"final_answer": final_with_sources}
 
 def routing_decision(state: GraphState):
-    # Safely fetch the feedback, defaulting to an empty string if missing
     feedback = state.get("critic_feedback", "")
     
-    # If Gemini outputted "PASS", go to the Formatter
+    # 1. Pass -> Go to Formatter
     if "PASS" in feedback:
         print("➡️ ROUTER: Draft passed! Sending to Formatter.")
         return "formatter"
     
-    # If it failed, check the loop count. 
-    # If we already looped, accept it as-is and force it to the Formatter.
+    # 2. Failed twice -> Fall back to Frontier Model Knowledge
     if state["loop_count"] >= 2:
-        print("➡️ ROUTER: Max loops reached. Forcing to Formatter.")
-        return "formatter"
+        print("➡️ ROUTER: Notes lack necessary context after retries. Routing to Frontier Fallback!")
+        return "fallback"
     
-    # Otherwise, loop back to the Retriever for a rewrite!
-    print("➡️ ROUTER: Issues found. Looping back to Retriever.")
+    # 3. Failed once -> Try Re-Retrieval with dynamic query adjustment
+    print("➡️ ROUTER: Critic identified missing info. Re-retrieving with refined query...")
     return "retriever"
 
-# Initialize the graph with our state definition
 workflow = StateGraph(GraphState)
 
-# 1. Add our Agent nodes
+# 1. ADD THE FALLBACK NODE
 workflow.add_node("retriever", retriever_agent)
 workflow.add_node("critic", critic_agent)
 workflow.add_node("formatter", formatter_agent)
+workflow.add_node("fallback", fallback_agent) 
 
-# 2. Define the strict flow
-workflow.add_edge(START, "retriever") # Always start here
-workflow.add_edge("retriever", "critic") # Retriever always hands off to Critic
-workflow.add_edge("formatter", END) # Formatter is always the last step
+# 2. DEFINE THE STANDARD EDGES
+workflow.add_edge(START, "retriever")
+workflow.add_edge("retriever", "critic")
+workflow.add_edge("formatter", END)
+workflow.add_edge("fallback", END) # Fallback also goes directly to END
 
-# 3. Add the conditional loop from Critic -> Formatter OR Retriever
+# 3. UPDATE THE CONDITIONAL ROUTING MAP
 workflow.add_conditional_edges(
     "critic", 
-    routing_decision,
-    # Map the strings returned by routing_decision to actual node names
+    routing_decision, 
     {
-        "formatter": "formatter",
-        "retriever": "retriever"
+        "formatter": "formatter", 
+        "retriever": "retriever",
+        "fallback": "fallback" # The router is now allowed to use this path!
     }
 )
 
-# 4. Compile it!
 app = workflow.compile()
 
-# --- START CONTINUOUS CHAT ---
+# ==========================================
+# 4. START CONTINUOUS CHAT
+# ==========================================
 print("\n🚀 Multi-Agent Study System Initialized! (Type 'exit' to quit)")
 
 running_history = ""
@@ -226,19 +300,15 @@ while True:
         print("Goodbye! Happy studying.")
         break
 
-    # Pass the question AND the running history into the graph
     initial_input: GraphState = {
         "question": user_input,
         "loop_count": 0,
         "chat_history": running_history
     }
     
-    # Run the multi-agent workflow
     final_state = app.invoke(initial_input)
-    
-    # Extract the final answer
     answer = final_state.get("final_answer", "Error: No answer generated.")
     print(f"\n✨ System:\n{answer}")
     
-    # Append this turn to the history so the next loop remembers it
+    # Store history for conversational context
     running_history += f"User: {user_input}\nSystem: {answer}\n\n"
