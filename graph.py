@@ -120,9 +120,36 @@ def critic_agent(state: GraphState):
 def formatter_agent(state: GraphState):
     print("✨ FORMATTER: Structuring final output with flashcards...")
     
-    # Use Gemini to turn state["draft_answer"] into Markdown/Flashcards
-    final = "Here is your beautiful answer with flashcards!"
+    draft = state.get("draft_answer", "")
+    question = state["question"]
     
+    # 1. Define the formatting instructions
+    formatting_prompt = f"""
+    You are an expert educational designer. Your task is to take a raw, verified academic answer and format it into a highly readable, structured study guide.
+    
+    [ORIGINAL QUESTION]
+    {question}
+    
+    [VERIFIED RAW ANSWER]
+    {draft}
+    
+    [INSTRUCTIONS]
+    1. Rewrite the raw answer into a clear, engaging explanation using Markdown formatting. Use headings, bullet points, and bold text for readability.
+    2. STRICT RULE: Do NOT add new factual information. You must only structure the facts provided in the raw answer.
+    3. At the end of your response, add a "## Flashcards" section. Generate 2 to 3 flashcards summarizing the core concepts from the answer. 
+    
+    Format the flashcards exactly like this:
+    **Q:** [Question]
+    **A:** [Answer]
+    ---
+       
+    Polished Output:
+    """
+    
+    # 2. Call Gemini to format the text
+    final = Settings.llm.complete(formatting_prompt).text
+    
+    # 3. Update the state with the final string
     return {"final_answer": final}
 
 def routing_decision(state: GraphState):
@@ -175,7 +202,7 @@ app = workflow.compile()
 print("\n--- STARTING WORKFLOW ---")
 
 # Explicitly type-hint the dictionary as GraphState
-initial_input: GraphState = {"question": "What is the capital of France?", "loop_count": 0}
+initial_input: GraphState = {"question": "Can you tell me about Saragam aluminium company?", "loop_count": 0}
 final_state = app.invoke(initial_input)
 
 print("\n--- FINAL OUTPUT ---")
