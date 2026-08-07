@@ -7,7 +7,7 @@ from llama_index.llms.google_genai import GoogleGenAI
 # 1. Load keys and configure models
 load_dotenv()
 Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
-Settings.llm = GoogleGenAI(model="gemini-3.5-flash-lite")
+Settings.llm = GoogleGenAI(model="gemini-3.6-flash")
 
 # 2. Connect to the existing ChromaDB
 print("Connecting to ChromaDB...")
@@ -27,7 +27,7 @@ index = VectorStoreIndex.from_vector_store(
 )
 
 # 4. Create a Retriever (fetches text, but doesn't auto-generate answers)
-retriever = index.as_retriever(similarity_top_k=3)
+retriever = index.as_retriever(similarity_top_k=10)
 
 from typing import TypedDict
 
@@ -68,7 +68,8 @@ def retriever_agent(state: GraphState):
     nodes = retriever.retrieve(search_query)
     context = "\n\n".join([node.get_content() for node in nodes])
     
-    # 3. Build the draft prompt
+    #print(f"Context being passed to gemini: {context}") # FOR DEBUGGING
+    # 2. Build the prompt dynamically
     prompt = (
         "You are a helpful study assistant. Answer the question using ONLY the provided context.\n\n"
         f"Question: {question}\n\n"
@@ -212,6 +213,9 @@ app = workflow.compile()
 print("\n🚀 Multi-Agent Study System Initialized! (Type 'exit' to quit)")
 
 running_history = ""
+# Explicitly type-hint the dictionary as GraphState
+initial_input: GraphState = {"question": "what does saragam aluminium company manufacture?", "loop_count": 0}
+final_state = app.invoke(initial_input)
 
 while True:
     user_input = input("\n📝 You: ")
