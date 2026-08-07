@@ -46,33 +46,42 @@ class GraphState(TypedDict):
 
 def retriever_agent(state: GraphState):
     print("🕵️ RETRIEVER: Fetching context and writing draft...")
+    
     question = state["question"]
+    history = state.get("chat_history", "")
     feedback = state.get("critic_feedback", "")
     
-    # 1. Fetch the most relevant chunks from ChromaDB
-    nodes = retriever.retrieve(question)
+    # 1. Handle Follow-up vs. New Topic
+    search_query = question
+    if history:
+        rewrite_prompt = (
+            "Given the following conversation history, rewrite the user's new question into a standalone search query. "
+            "If it is a completely new topic, just return the original question.\n\n"
+            f"History:\n{history}\n\n"
+            f"New Question: {question}\n\n"
+            "Standalone Query:"
+        )
+        search_query = Settings.llm.complete(rewrite_prompt).text.strip()
+        print(f"🔄 CONTEXTUALIZED QUERY: {search_query}")
     
-    # Combine the text from the retrieved chunks
+    # 2. Fetch context using the STANDALONE query
+    nodes = retriever.retrieve(search_query)
     context = "\n\n".join([node.get_content() for node in nodes])
     
-    # 2. Build the prompt dynamically
+    # 3. Build the draft prompt
     prompt = (
         "You are a helpful study assistant. Answer the question using ONLY the provided context.\n\n"
         f"Question: {question}\n\n"
         f"Context:\n{context}\n\n"
     )
     
-    # 3. If the graph looped back, inject the Critic's instructions!
     if feedback:
-        print(f"🕵️ RETRIEVER: Adjusting based on feedback: {feedback}")
-        prompt += f"PREVIOUS ATTEMPT FEEDBACK:\nA reviewer found this issue with your last draft: '{feedback}'. Please fix it in this new draft.\n\n"
+        prompt += f"PREVIOUS ATTEMPT FEEDBACK:\nFix this issue: '{feedback}'.\n\n"
         
     prompt += "Draft Answer:"
     
-    # 4. Generate the draft using the globally configured Gemini model
+    # 4. Generate the draft
     draft = Settings.llm.complete(prompt).text
-    
-    # Increment the loop count
     current_loops = state.get("loop_count", 0) + 1
     
     return {"draft_answer": draft, "loop_count": current_loops, "context": context}
@@ -199,13 +208,31 @@ workflow.add_conditional_edges(
 # 4. Compile it!
 app = workflow.compile()
 
-# --- TEST THE LOOP ---
-print("\n--- STARTING WORKFLOW ---")
+# --- START CONTINUOUS CHAT ---
+print("\n🚀 Multi-Agent Study System Initialized! (Type 'exit' to quit)")
 
-# Explicitly type-hint the dictionary as GraphState
-initial_input: GraphState = {"question": "Can you tell me about Saragam aluminium company?", "loop_count": 0}
-final_state = app.invoke(initial_input)
+running_history = ""
 
-print("\n--- FINAL OUTPUT ---")
-# Safely print the final answer using .get() just in case the workflow failed
-print(final_state.get("final_answer", "No answer generated."))
+while True:
+    user_input = input("\n📝 You: ")
+    
+    if user_input.lower() in ["exit", "quit", "q"]:
+        print("Goodbye! Happy studying.")
+        break
+
+    # Pass the question AND the running history into the graph
+    initial_input: GraphState = {
+        "question": user_input,
+        "loop_count": 0,
+        "chat_history": running_history
+    }
+    
+    # Run the multi-agent workflow
+    final_state = app.invoke(initial_input)
+    
+    # Extract the final answer
+    answer = final_state.get("final_answer", "Error: No answer generated.")
+    print(f"\n✨ System:\n{answer}")
+    
+    # Append this turn to the history so the next loop remembers it
+    running_history += f"User: {user_input}\nSystem: {answer}\n\n"
