@@ -14,7 +14,7 @@ from llama_cloud import LlamaCloud
 from llama_index.core import Document, Settings, StorageContext, VectorStoreIndex
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.google_genai import GoogleGenAI
-from llama_index.llms.groq import Groq  # NEW: Import Groq
+from llama_index.llms.groq import Groq
 from llama_index.vector_stores.chroma import ChromaVectorStore
 
 nest_asyncio.apply()
@@ -62,7 +62,17 @@ result = client.parsing.parse(
     tier="agentic", 
     version="latest",
     file_id=file_upload.id,
-    expand=["markdown"] 
+    expand=["markdown"],
+    agentic_options={
+        "custom_prompt": """
+        This document contains handwritten notes with non-linear spatial layouts, mind-maps, and arrows. 
+        CRITICAL INSTRUCTIONS:
+        1. DO NOT simply read top-to-bottom left-to-right. 
+        2. Follow the visual flow of arrows and spatial grouping. 
+        3. If a concept points to sub-items (e.g., "3 major forces" pointing to other words), you MUST group those items together under a Markdown heading or bulleted list.
+        4. Keep distinct case studies and examples separated from the main theoretical points.
+        """
+    }
 )
 
 print("Cleaning OCR and formatting with Gemini (ELT Step)...")
@@ -136,20 +146,33 @@ if result.markdown and result.markdown.pages:
     # Join the fully cleaned and verified pages
     full_text = "\n\n".join(valid_pages)
 
+    if not full_text:
+        raise RuntimeError("Parsing finished, but no valid markdown text was returned.")
+
+    # --- NEW: SAVE THE MARKDOWN LOCALLY ---
+    output_path = "./parsed_notes_debug.md"
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(full_text)
+    print(f"💾 Saved parsed markdown to '{output_path}' for review.")
+    # --------------------------------------
+
+    documents = [Document(text=full_text, metadata={"file_name": "student_notes.pdf"})]
+    print("Successfully extracted and cleaned markdown!")
+
 if not full_text:
     raise RuntimeError("Parsing finished, but no valid markdown text was returned.")
 
-documents = [Document(text=full_text)]
+documents = [Document(text=full_text, metadata={"file_name": "marketing_101.pdf"})]
 print("Successfully extracted and cleaned markdown!")
 
 from llama_index.core.node_parser import SentenceWindowNodeParser
 
 print("Chunking document using Sentence Windows...")
 
-# Initialize the parser. window_size=5 means each sentence gets 
-# the 5 sentences before it and the 5 sentences after it attached as metadata.
+# Initialize the parser. window_size=2 means each sentence gets 
+# the 2 sentences before it and the 2 sentences after it attached as metadata.
 node_parser = SentenceWindowNodeParser.from_defaults(
-    window_size=5,
+    window_size=2,
     window_metadata_key="window",
     original_text_metadata_key="original_text",
 )
