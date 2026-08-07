@@ -70,6 +70,7 @@ def retriever_agent(state: GraphState):
     
     #print(f"Context being passed to gemini: {context}") # FOR DEBUGGING
     # 2. Build the prompt dynamically
+    # 3. Build the draft prompt
     prompt = (
         "You are a helpful study assistant. Answer the question using ONLY the provided context.\n\n"
         f"Question: {question}\n\n"
@@ -216,6 +217,7 @@ running_history = ""
 # Explicitly type-hint the dictionary as GraphState
 initial_input: GraphState = {"question": "what does saragam aluminium company manufacture?", "loop_count": 0}
 final_state = app.invoke(initial_input)
+running_history = ""
 
 while True:
     user_input = input("\n📝 You: ")
