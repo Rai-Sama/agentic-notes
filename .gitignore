@@ -10,6 +10,8 @@ __pycache__/
 
 # Test Data
 student_notes.pdf
+student_notes/
+processed_notes/
 
 # Ignore any file ending in _debug
 *_debug.*
