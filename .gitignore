@@ -18,3 +18,7 @@ processed_notes/
 
 # Ignore any folder ending in _debug and all of its contents
 *_debug/
+
+# Chainlit
+.chainlit/translations/
+chainlit.md
