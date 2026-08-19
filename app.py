@@ -1,5 +1,7 @@
 import asyncio
 import os
+import shutil
+from pathlib import Path
 from typing import TypedDict
 
 import chainlit as cl
@@ -8,7 +10,9 @@ from dotenv import load_dotenv
 from google.genai.errors import APIError as GoogleAPIError
 from groq import APIError as GroqAPIError
 from langgraph.graph import END, START, StateGraph
-from llama_index.core import Settings, StorageContext, VectorStoreIndex
+from llama_cloud import LlamaCloud
+from llama_index.core import Document, Settings, StorageContext, VectorStoreIndex
+from llama_index.core.node_parser import SentenceWindowNodeParser
 from llama_index.core.postprocessor import MetadataReplacementPostProcessor
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.google_genai import GoogleGenAI
@@ -86,6 +90,18 @@ retriever = index.as_retriever(
     similarity_top_k=3, 
     node_postprocessors=[postprocessor]
 )
+
+# Configure parsing tools for file uploads
+client = LlamaCloud()
+node_parser = SentenceWindowNodeParser.from_defaults(
+    window_size=1, 
+    window_metadata_key="window",
+    original_text_metadata_key="original_text",
+)
+
+# Ensure the processed notes directory exists
+processed_dir = Path("./processed_notes")
+processed_dir.mkdir(exist_ok=True)
 
 # ==========================================
 # 3. LANGGRAPH STATE & AGENTS
@@ -299,6 +315,68 @@ def routing_decision(state: GraphState):
     print("➡️ ROUTER: Critic identified missing info. Re-retrieving with refined query...")
     return "retriever"
 
+async def ingest_file_async(file_path: Path):
+    async with cl.Step(name="📄 Ingesting Notes") as step:
+        step.input = f"Processing {file_path.name}..."
+        
+        # 1. PARSE with LlamaCloud
+        file_upload = client.files.create(file=file_path, purpose="parse")
+        result = client.parsing.parse(
+            tier="agentic", 
+            version="latest",
+            file_id=file_upload.id,
+            expand=["markdown"],
+            agentic_options={
+                "custom_prompt": """
+                This document contains handwritten notes, diagrams, and text with non-linear spatial layouts.
+                CRITICAL INSTRUCTIONS:
+                1. Follow the visual flow of arrows and spatial grouping.
+                2. DIAGRAMS & IMAGES: Output a placeholder EXACTLY like this: [DIAGRAM: descriptive_name.png]
+                3. Provide a highly detailed textual description of what the diagram shows immediately after.
+                """
+            }
+        )
+        
+        # 2. CLEAN
+        valid_pages = []
+        if result.markdown and result.markdown.pages:
+            for i, page in enumerate(result.markdown.pages):
+                page_text = getattr(page, "markdown", None)
+                if isinstance(page_text, str) and page_text.strip():
+                    step.output = f"Cleaning page {i + 1}..."
+                    cleaning_prompt = f"""
+                    You are a data engineer cleaning raw OCR text from student notes.
+                    CRITICAL RULES:
+                    1. Maintain original Markdown formatting.
+                    2. Do NOT summarize or add commentary.
+                    3. PRESERVE ALL [DIAGRAM: ...] placeholders and their descriptions exactly.
+                    
+                    [RAW OCR TEXT]
+                    {page_text}
+                    
+                    [CLEANED TEXT]
+                    """
+                    valid_pages.append(await call_llm_with_fallback(cleaning_prompt))
+                    
+        full_text = "\n\n".join(valid_pages)
+        
+        if not full_text.strip():
+            step.is_error = True
+            step.output = f"⚠️ Warning: No valid text extracted from {file_path.name}."
+            return False
+
+        # 3. CHUNK AND EMBED
+        doc = Document(text=full_text, metadata={"file_name": file_path.name})
+        nodes = node_parser.get_nodes_from_documents([doc])
+        index.insert_nodes(nodes)
+        
+        # 4. ARCHIVE
+        destination = processed_dir / file_path.name
+        shutil.move(str(file_path), str(destination))
+        
+        step.output = f"✅ Success! {file_path.name} is now in your study database."
+        return True
+
 # Build the workflow globally
 workflow = StateGraph(GraphState)
 workflow.add_node("retriever", retriever_agent)
@@ -327,7 +405,23 @@ async def on_chat_start():
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    # Fetch the history from the user's session
+    # 1. Handle File Uploads First
+    if message.elements:
+        for element in message.elements:
+            # Type safety: Ensure the element actually has a path and mime type
+            if element.path and element.mime:
+                mime_type = element.mime.lower()
+                
+                if "pdf" in mime_type or "image" in mime_type or "powerpoint" in mime_type or "presentation" in mime_type:
+                    temp_path = Path(element.path)
+                    await ingest_file_async(temp_path)
+        
+        # If the user only uploaded a file and didn't type a question, stop here.
+        if not message.content.strip():
+            await cl.Message(content="✅ Files processed and embedded successfully! What would you like to know about them?").send()
+            return
+            
+    # 2. Proceed with normal Agent workflow
     running_history = cl.user_session.get("chat_history") or ""
     
     initial_input: GraphState = {
@@ -336,15 +430,10 @@ async def on_message(message: cl.Message):
         "chat_history": running_history
     }
     
-    # Run the graph asynchronously! 
-    # Because we used cl.Step inside the agents, they will automatically pop up in the UI as it runs.
     final_state = await app.ainvoke(initial_input)
-    
     answer = final_state.get("final_answer", "Error: No answer generated.")
     
-    # Send the final output to the user
     await cl.Message(content=answer).send()
     
-    # Update the running history for the next question
     running_history += f"User: {message.content}\nSystem: {answer}\n\n"
     cl.user_session.set("chat_history", running_history)
