@@ -9,8 +9,6 @@ from dotenv import load_dotenv
 load_dotenv() 
 
 import chromadb
-from google.genai.errors import APIError as GoogleAPIError
-from groq import APIError as GroqAPIError
 from llama_cloud import LlamaCloud
 from llama_index.core import Document, Settings, StorageContext, VectorStoreIndex
 from llama_index.core.node_parser import SentenceWindowNodeParser
